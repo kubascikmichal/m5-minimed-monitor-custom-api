@@ -89,7 +89,9 @@ Before using the *M5 Minimed Monitor*, there are basically 3 items which need to
 
 * Credentials of your Wifi network
 * An NTP server address and your time zone
-* The network address of the Carelink proxy
+* The network address of the Carelink proxy (optional)
+
+If the Carelink proxy IP address is left empty, the device reads data from the medical API at `https://cgm.kubascik.eu/api/users`. It identifies itself with its serial number `M5MM-<WIFI MAC>` (e.g. `M5MM-A1B2C3D4E5F6`), which is printed on the serial console at boot. The device must be registered under this SNR in the medical API, otherwise "Unknown device" is shown. The medical API currently provides only glucose value, trend, sensor state and reading time; all other values are shown as unknown. The time zone (including daylight saving time) is taken from the device configuration only.
 
 When starting the *M5 Minimed Monitor* for the first time (or if Wifi connection cannot be established with the current configuration), it will automatically switch into Access Point (configuration) mode and prompt you to connect to the Wifi network "M5_MINIMED_MON" (password is `123456789`) with your mobile phone or a PC. Then you can connect to the configuration Web UI at `http://192.168.4.1`
 

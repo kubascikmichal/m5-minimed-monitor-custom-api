@@ -40,6 +40,7 @@
 #    31/03/2025 - Fix regression bug in DST handling
 #    01/09/2026 - Porting to UIFlow2
 #    02/11/2026 - Improve initial device configuration procedure
+#    13/11/2026 - Add medical API data source (used when no proxy is configured)
 #
 #
 #  Copyright 2021-2026, Ondrej Wisniewski
@@ -71,6 +72,7 @@ import ntptime
 from hardware import Timer
 if sys.platform == "esp32":
    import esp
+   import esp32
    import machine
    import network
    import socket
@@ -85,15 +87,23 @@ else:
 #
 #################################################
 
-VERSION = "2.1"
+VERSION = "2.2"
 
 # Default configuration parameters
 DEFAULT_NTP_SERVER = "pool.ntp.org"
 DEFAULT_TIME_ZONE  = 1
 DEFAULT_PROXY_PORT = 8081
 
-# Access point parameters
+# Carelink proxy API (used when a proxy address is configured)
 API_URL     = "carelink/nohistory"
+
+# Medical API (used when no proxy address is configured)
+MEDICAL_API_HOST = "cgm.kubascik.eu"
+MEDICAL_API_PORT = 443
+MEDICAL_API_URL  = "https://%s/api/users" % MEDICAL_API_HOST
+SNR_PREFIX       = "M5MM-"
+
+# Access point parameters
 AP_SSID     = "M5_MINIMED_MON"
 AP_ADDR     = "192.168.4.1"
 
@@ -163,6 +173,7 @@ runNtpsync        = False
 runTimeupdate     = False
 runPumpdataupdate = False
 wlan          = None
+snr           = None
 msgboxDelConf    = None
 
 # Fault ID mapping
@@ -438,9 +449,25 @@ def web_page_success():
    return html
 
 
+def url_decode(value):
+   # Decode form encoded value ("+" is space, "%XX" is an escaped byte)
+   value = value.replace("+", " ")
+   parts = value.split("%")
+   res = bytearray(parts[0].encode())
+   for part in parts[1:]:
+      try:
+         res.append(int(part[:2], 16))
+         res.extend(part[2:].encode())
+      except ValueError:
+         res.extend(("%" + part).encode())
+   try:
+      return res.decode()
+   except UnicodeError:
+      return value
+
 def get_url_param(url,param):
    try:
-      value = url.split("?")[1].split(param+"=")[1].split("&")[0]
+      value = url_decode(url.split("?")[1].split(param+"=")[1].split("&")[0])
    except IndexError:
       value = None
    return value
@@ -477,7 +504,7 @@ def do_access_point(ntpserver,timezone,proxyport):
       for net in netlist:
          ssidlist.append((net[0].decode(),net[3]))
    else:
-      ssidlist = ("no network found", 0)
+      ssidlist = [("no network found", 0)]
    # Start access point
    ap = network.WLAN(network.AP_IF)
    ap.active(True)
@@ -488,7 +515,8 @@ def do_access_point(ntpserver,timezone,proxyport):
 
    # Wait for client to connect
    while ap.isconnected() == False:
-       pass
+       # Sleep lets scheduled UI tasks run (busy loop overflows schedule queue)
+       time.sleep_ms(100)
    do_ap_msg("WIFI connection established\nLoad address %s in web browser" % (AP_ADDR), "qrcode-apurl.png")
 
    # Get device parameters via Web GUI
@@ -525,9 +553,8 @@ def do_access_point(ntpserver,timezone,proxyport):
             wifipass  != None and wifipass  != "" and \
             ntpserver != None and ntpserver != "" and \
             timezone1 != None and timezone1 != "" and \
-            timezone2 != None and timezone2 != "" and \
-            proxyaddr != None and proxyaddr != "" and \
-            proxyport != None and proxyport != "":
+            timezone2 != None and timezone2 != "":
+            # Proxy parameters are optional: no proxy address means medical API is used
 
             print("New configuration parameters received\n")
             # Send reboot page
@@ -559,19 +586,27 @@ def do_access_point(ntpserver,timezone,proxyport):
       nvs.set_i8('timezone', DEFAULT_TIME_ZONE)
    time.sleep_ms(100)
 
-   nvs.set_str('proxyaddr', proxyaddr.strip())
+   proxyaddr = proxyaddr.strip() if proxyaddr else ""
+   if proxyaddr != "":
+      nvs.set_str('proxyaddr', proxyaddr)
+   else:
+      # No proxy configured, use medical API
+      try:
+         nvs.erase_key('proxyaddr')
+      except OSError:
+         pass
    time.sleep_ms(100)
 
    try:
       nvs.set_u16('proxyport', int(proxyport))
    except:
       print("invalid proxy port, saving default")
-      nvs.set_u16(DEFAULT_PROXY_PORT)
+      nvs.set_u16('proxyport', DEFAULT_PROXY_PORT)
    time.sleep_ms(100)
 
    nvs.commit()
    print("New configuration parameters stored in EEPROM\n")
-   print("wifissid: %s, wifipass: %s, proxyaddr: %s, proxyport: %s, ntpserver: %s, timezone: %s\n" % (wifissid,wifipass,proxyaddr,proxyport,ntpserver,timezone))
+   print("wifissid: %s, proxyaddr: %s, proxyport: %s, ntpserver: %s, timezone: %s\n" % (wifissid,proxyaddr,proxyport,ntpserver,timezone))
    do_ap_msg("New configuration parameters stored in EEPROM\nResetting device ...", None)
 
    # Reset device
@@ -598,12 +633,19 @@ def read_config():
             timezone = "GMT%d" % tz_int
          else:
             timezone = "GMT+%d" % tz_int
-         proxyaddr = nvs.get_str('proxyaddr')
-         proxyport = str(nvs.get_u16('proxyport'))
       except OSError:
          print("Needed configuration parameters not found in EEPROM\n")
          # Start access point for configuration
          do_access_point(DEFAULT_NTP_SERVER,DEFAULT_TIME_ZONE,DEFAULT_PROXY_PORT)
+      # Proxy parameters are optional (not set means medical API is used)
+      try:
+         proxyaddr = nvs.get_str('proxyaddr').strip()
+      except OSError:
+         proxyaddr = ""
+      try:
+         proxyport = str(nvs.get_u16('proxyport'))
+      except OSError:
+         proxyport = str(DEFAULT_PROXY_PORT)
    else:
       wifissid = None
       wifipass = None
@@ -642,6 +684,23 @@ def wlan_connect(wifissid, wifipass):
       else:
          print("Wifi connected (IP %s, GW %s, RSSI %d)" % (w.ifconfig()[0], w.ifconfig()[2], w.status("rssi")))
    return w
+
+
+#################################################
+#
+# Device identification
+#
+#################################################
+
+def get_device_snr():
+   # Device serial number used by medical API: prefix + WIFI MAC address (uppercase hex, no colons)
+   if sys.platform == "esp32":
+      mac = network.WLAN(network.STA_IF).config('mac')
+      mac_hex = "".join("%02X" % b for b in mac)
+   else:
+      import uuid
+      mac_hex = "%012X" % uuid.getnode()
+   return SNR_PREFIX + mac_hex
 
 
 #################################################
@@ -755,7 +814,7 @@ def convert_datetimestr_to_epoch(datetimestr):
    # yyyy-mm-ddThh:mm:ss.000-00:00
    try:
       d  = datetimestr.split('.')[0].split('T')[0]
-      t  = datetimestr.split('.')[0].split('T')[1]
+      t  = datetimestr.split('.')[0].split('T')[1][:8]
       year = int(d.split('-')[0])
       mon  = int(d.split('-')[1])
       day  = int(d.split('-')[2])
@@ -764,6 +823,35 @@ def convert_datetimestr_to_epoch(datetimestr):
       sec  = int(t.split(':')[2])
       #print("%d-%d-%d %d:%d:%d"%(year,mon,day,hour,min,sec))
       return time.mktime((year,mon,day,hour,min,sec,0,0,dstDelta))
+   except:
+      return 0
+
+def days_from_civil(year, mon, day):
+   # Days since 1970-01-01 for a Gregorian date (independent of local time zone)
+   if mon <= 2:
+      year -= 1
+   era = (year if year >= 0 else year-399) // 400
+   yoe = year - era * 400
+   doy = (153*(mon + (-3 if mon > 2 else 9)) + 2)//5 + day-1
+   doe = yoe * 365 + yoe//4 - yoe//100 + doy
+   return era * 146097 + doe - 719468
+
+def convert_isodatetime_to_utc_epoch(datetimestr):
+   # datetime string format is the following:
+   # yyyy-mm-ddThh:mm:ss[.ffffff][+hh:mm|-hh:mm|Z]
+   try:
+      d, t = datetimestr.strip().split('T')
+      offset = 0
+      if t.endswith('Z'):
+         t = t[:-1]
+      elif len(t) > 8 and t[-6] in "+-":
+         sign = 1 if t[-6] == "+" else -1
+         offset = sign * (int(t[-5:-3])*3600 + int(t[-2:])*60)
+         t = t[:-6]
+      t = t.split('.')[0]
+      year, mon, day = [int(x) for x in d.split('-')]
+      hour, min, sec = [int(x) for x in t.split(':')]
+      return days_from_civil(year, mon, day)*86400 + hour*3600 + min*60 + sec - offset
    except:
       return 0
 
@@ -896,6 +984,13 @@ def handle_devstatusupdate():
 #################################################
 
 def handle_pumpdataupdate(proxyaddr, proxyport):
+   if proxyaddr:
+      handle_carelinkupdate(proxyaddr, proxyport)
+   else:
+      handle_medicalapiupdate()
+
+
+def handle_carelinkupdate(proxyaddr, proxyport):
    global page1, page1, page2, imageBattery, imageReservoir, imageSensorConn, imageDrop, imageSage, imageShield, imageBanner, labelBglValue, labelBglUnit, labelActInsValue, labelActIns, labelTime, labelLastData, labelSage, timer0, timer1, timer2, timer3
    global lastErrorMsg
    global lastStatusMsg
@@ -911,6 +1006,7 @@ def handle_pumpdataupdate(proxyaddr, proxyport):
       r = requests.get(proxy_url, headers={'Content-Type': 'application/json'}, timeout=20)
       jdata = r.json()
       print("status code: %d" % (r.status_code))
+      r.close()
    except:
       r = None
    
@@ -1006,6 +1102,121 @@ def handle_pumpdataupdate(proxyaddr, proxyport):
          labelAverageSgValue.set_text(str(jdata["averageSG"])+" mg/dl")
       except:
          pass
+
+
+#################################################
+#
+# Medical API data update handler
+#
+#################################################
+
+def show_error_msg(msg):
+   global lastErrorMsg
+   if lastErrorMsg != None:
+      lastErrorMsg.delete()
+      lastErrorMsg = None
+   if msg:
+      lastErrorMsg = m5ui.M5Msgbox(title=msg, x=0, y=100, w=SCREEN_WIDTH, h=45, parent=page1)
+
+def show_status_msg(msg):
+   global lastStatusMsg
+   if lastStatusMsg != None:
+      lastStatusMsg.delete()
+      lastStatusMsg = None
+   if msg:
+      lastStatusMsg = m5ui.M5Msgbox(title=msg, x=0, y=50, w=SCREEN_WIDTH, h=45, parent=page1)
+
+def show_medicalapi_data(cgm):
+   # Data not (yet) provided by medical API is shown as unknown
+   global lastUpdateTm
+   imageBattery.set_image(FLASH_IMG+"mm_batt_unk.jpg")
+   imageReservoir.set_image(FLASH_IMG+"mm_tank_unk.jpg")
+   imageSage.set_image(FLASH_IMG+"mm_sage_unk.jpg")
+   labelSage.set_text("")
+   imageSensorConn.set_image(FLASH_IMG+"mm_sensor_connection_nok.jpg")
+   imageBanner.set_flag(lv.obj.FLAG.HIDDEN, True)
+   labelActInsValue.set_text("-- U")
+   labelActInsValue.align_to(page1, lv.ALIGN.TOP_RIGHT, 0, 173)
+   labelBasalRate.set_flag(lv.obj.FLAG.HIDDEN, True)
+   labelBasalPatt.set_flag(lv.obj.FLAG.HIDDEN, True)
+   try:
+      labelAboveTargetValue.set_text("-- %")
+      labelInTargetValue.set_text("-- %")
+      labelBelowTargetValue.set_text("-- %")
+      labelAverageSgValue.set_text("-- mg/dl")
+   except:
+      pass
+
+   if cgm == None:
+      lastUpdateTm = 0
+      sensorState = "UNKNOWN"
+      sg = 0
+      trend = None
+   else:
+      lastUpdateTm = convert_isodatetime_to_utc_epoch(cgm.get("reading_time") or "")
+      sensorState = cgm.get("sensor_state") or "UNKNOWN"
+      try:
+         sg = int(round(float(cgm.get("glucose_value") or 0)))
+      except (TypeError, ValueError):
+         sg = 0
+      trend = cgm.get("trend")
+
+   # Calibration status is unknown, drop icon only reflects sensor state
+   time_to_calib_progress(False, 255, sensorState, "UNKNOWN")
+
+   # Trend arrow
+   if trend in ("UP", "UP_DOUBLE", "UP_TRIPLE", "DOWN", "DOWN_DOUBLE", "DOWN_TRIPLE", "NONE"):
+      imageShield.set_image(FLASH_IMG+"mm_shield_"+trend.lower()+".jpg")
+      imageShield.set_flag(lv.obj.FLAG.HIDDEN, False)
+   else:
+      imageShield.set_flag(lv.obj.FLAG.HIDDEN, True)
+
+   # Glucose value
+   labelBglValue.set_text(str(sg) if sg > 0 else "--")
+   labelBglValue.align_to(page1, lv.ALIGN.CENTER, 0, 0)
+
+   # Sensor state message
+   if cgm == None or sensorState in ("NO_ERROR_MESSAGE", "UNKNOWN"):
+      show_status_msg(None)
+   else:
+      show_status_msg(sensorState.replace("_"," "))
+
+def handle_medicalapiupdate():
+   global dstDelta
+   api_url = "%s?snr=%s" % (MEDICAL_API_URL, snr)
+
+   print("update medical API data")
+
+   # Get data from medical API
+   try:
+      r = requests.get(api_url, headers={'Accept': 'application/json'}, timeout=20)
+      status = r.status_code
+      print("status code: %d" % (status))
+      jdata = r.json() if status == 200 else None
+      r.close()
+   except Exception as e:
+      print("medical API request failed: %s" % e)
+      # Keep last data on screen
+      return
+
+   # Time zone is taken from device configuration only
+   dstDelta = 0
+
+   try:
+      if status == 403:
+         print("device %s not registered in medical API" % snr)
+         show_error_msg("Unknown device %s" % snr)
+         show_medicalapi_data(None)
+      elif status == 200:
+         if isinstance(jdata, list) and len(jdata) > 0:
+            show_error_msg(None)
+            show_medicalapi_data(jdata[0].get("latest_cgm"))
+         else:
+            show_error_msg("No patient for %s" % snr)
+            show_medicalapi_data(None)
+      # Other errors: keep last data on screen
+   except Exception as e:
+      print("medical API data error: %s" % e)
 
 
 #################################################
@@ -1145,6 +1356,7 @@ def setup():
    global proxyaddr
    global proxyport
    global wlan
+   global snr
 
    # Init M5 libraries
    M5.begin()
@@ -1162,10 +1374,15 @@ def setup():
   
    # Read config from EEPROM
    wifissid,wifipass,proxyaddr,proxyport,ntpserver,timezone = read_config()
-   print("wifissid: %s, wifipass: %s, proxyaddr: %s, proxyport: %s, ntpserver: %s, timezone: %s\n" % (wifissid,wifipass,proxyaddr,proxyport,ntpserver,timezone))
+   print("wifissid: %s, proxyaddr: %s, proxyport: %s, ntpserver: %s, timezone: %s\n" % (wifissid,proxyaddr,proxyport,ntpserver,timezone))
 
    # Wifi connection
    wlan = wlan_connect(wifissid, wifipass)
+
+   # Device serial number for medical API
+   snr = get_device_snr()
+   print("device SNR: %s" % snr)
+   print("data source: %s\n" % ("Carelink proxy %s:%s" % (proxyaddr, proxyport) if proxyaddr else MEDICAL_API_URL))
 
    # Create pages
    page1 = m5ui.M5Page(bg_c=0x000000)
@@ -1224,9 +1441,9 @@ def setup():
    # Carelink proxy settings
    labelCarelinkProxy = m5ui.M5Label('Carelink Proxy', x=31, y=124, text_c=0x09f31a, font=lv.font_montserrat_18, parent=page3)
    labelIpAddress   = m5ui.M5Label('IP address', x=52, y=151, text_c=0xffffff, font=lv.font_montserrat_14, parent=page3)
-   labelMyIpAddress = m5ui.M5Label(proxyaddr, x=143, y=151, text_c=0xffffff, font=lv.font_montserrat_14, parent=page3)
+   labelMyIpAddress = m5ui.M5Label(proxyaddr if proxyaddr else MEDICAL_API_HOST, x=143, y=151, text_c=0xffffff, font=lv.font_montserrat_14, parent=page3)
    labelPort        = m5ui.M5Label('Port', x=52, y=173, text_c=0xffffff, font=lv.font_montserrat_14, parent=page3)
-   labelMyPort      = m5ui.M5Label(proxyport, x=143, y=173, text_c=0xffffff, font=lv.font_montserrat_14, parent=page3)
+   labelMyPort      = m5ui.M5Label(str(proxyport) if proxyaddr else str(MEDICAL_API_PORT), x=143, y=173, text_c=0xffffff, font=lv.font_montserrat_14, parent=page3)
 
    # Button on page 3
    imageDelBtn      = m5ui.M5Image(FLASH_IMG+"btn-delete.jpg", x=280, y=200, rotation=0, scale_x=1, scale_y=1, parent=page3)
